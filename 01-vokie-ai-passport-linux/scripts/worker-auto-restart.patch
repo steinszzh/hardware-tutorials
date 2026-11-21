@@ -1,0 +1,19 @@
+--- a/worker/index.mjs
++++ b/worker/index.mjs
+@@ -1396,10 +1396,13 @@
+       }
+     });
+     child.on?.('close', () => {
+       const isCurrent = child === processHandle;
+       const wasRequested = helperStopRequested.has(processHandle);
+       if (!stopping && isCurrent && !wasRequested) {
+-        failHelper('AI Passport helper stopped', processHandle, { fatal: true });
++        child = null;
++        clearDeviceIdentity();
++        diagnostic('AI Passport helper exited; restarting', 'warn');
++        setTimeout(() => {
++          if (!stopping && !child) startHelper();
++        }, 1000).unref?.();
+       }
+     });
+     state('starting');

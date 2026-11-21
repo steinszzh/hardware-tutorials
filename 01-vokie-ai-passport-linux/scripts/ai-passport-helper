@@ -1,0 +1,1268 @@
+#!/usr/bin/env python3
+"""Linux BLE helper for the AI Passport Vokie plugin.
+
+This is a Linux (BlueZ/bleak) re-implementation of the macOS Swift helper
+(AiPassportHelper.swift) that ships with the vokie-ai-passport-firmware
+plugin.  It speaks the exact same newline-delimited JSON protocol over
+stdin/stdout so the unmodified plugin worker can drive it:
+
+  stdin  (host -> helper): shutdown / host_ready / host_state /
+                           set-preferred-device
+  stdout (helper -> host): error / diagnostic / discovered / connected /
+                           subscribed / disconnected / control / audio
+
+The helper owns the BLE central role: it scans for the "Vokie Passport"
+peripheral (GATT voice service 7f0e0001-...), connects, subscribes to the
+Control and Audio characteristics, reads and validates the Device-info
+`hello`, reassembles IMA ADPCM audio frames, and forwards everything to the
+worker as base64 events.
+"""
+
+import asyncio
+import base64
+import fcntl
+import glob
+import json
+import os
+import signal
+import struct
+import sys
+import threading
+import time
+from collections import OrderedDict
+
+try:
+    from bleak import BleakClient, BleakScanner
+except ImportError:
+    for _cand in sorted(
+        glob.glob(
+            os.path.expanduser(
+                "~/.local/share/vokie-bridge/venv/lib/python*/site-packages"
+            )
+        ),
+        reverse=True,
+    ):
+        if _cand not in sys.path:
+            sys.path.insert(0, _cand)
+    from bleak import BleakClient, BleakScanner
+
+# ---------------------------------------------------------------------------
+# Protocol constants (mirror vokie-plugin/worker/protocol.mjs and the Swift
+# helper's AiPassportBleConstants).
+# ---------------------------------------------------------------------------
+
+SERVICE_UUID = "7f0e0001-6a7b-4b6f-9d1a-564f4b494500"
+CONTROL_UUID = "7f0e0002-6a7b-4b6f-9d1a-564f4b494500"
+AUDIO_UUID = "7f0e0003-6a7b-4b6f-9d1a-564f4b494500"
+INFO_UUID = "7f0e0004-6a7b-4b6f-9d1a-564f4b494500"
+
+DEFAULT_TARGET_MAC = os.environ.get(
+    "VOKIE_PASSPORT_MAC", ""
+).strip().upper()
+
+HOST_READY_BYTES = b'{"v":1,"type":"host_ready"}'
+
+MAX_COMMAND_LINE_BYTES = 182
+MAX_LINE_BYTES = 16 * 1024
+MAX_DEVICE_FIELD_BYTES = 256
+MAX_DIAGNOSTIC_MESSAGE_BYTES = 128
+MAX_CONTROL_PAYLOAD_BYTES = 182
+CONTROL_WRITE_QUEUE_LIMIT = 64
+CONTROL_WRITE_RETRIES = 3
+CONTROL_WRITE_RETRY_INTERVAL = 0.1
+
+ADPCM_FRAME_BYTES = 166
+AUDIO_HEADER_BYTES = 16
+AUDIO_MAGIC = 0x5041
+MAX_AUDIO_FRAGMENTS = 64
+MAX_PENDING_AUDIO_FRAMES = 64
+COMPLETED_FRAME_CACHE = 128
+MAX_AUDIO_SEQUENCE = 15000
+
+CONNECT_TIMEOUT = 20.0
+RECONNECT_MAX_BACKOFF = 15.0
+WATCHDOG_INTERVAL = 0.25
+SCAN_FOR_PREFERRED_WINDOW = 20.0
+SCAN_RESET_TRIGGER_DELAY = 4.0
+USB_RESET_COOLDOWN = 25.0
+USB_BOOT_WAIT = 4.2
+RETRY_PAUSE = 1.5
+
+TIOCMGET = 0x5415
+TIOCMSET = 0x5418
+TIOCM_RTS = 0x004
+
+VALID_HOST_STATES = ("ready", "recording", "processing", "success", "error")
+
+LAUNCH_PARENT_PID = os.getppid()
+DEBUG = os.environ.get("VOKIE_HELPER_DEBUG") == "1"
+DISABLE_USB_RESET = os.environ.get("VOKIE_DISABLE_USB_RESET") == "1"
+
+
+def dbg(message):
+    if DEBUG:
+        try:
+            sys.stderr.write("debug: %s\n" % message)
+            sys.stderr.flush()
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Output helpers (thread-safe, one JSON object per line, always flushed).
+# ---------------------------------------------------------------------------
+
+_out_lock = threading.Lock()
+
+
+def emit(obj):
+    try:
+        line = json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
+    except Exception:
+        return
+    with _out_lock:
+        try:
+            sys.stdout.write(line + "\n")
+            sys.stdout.flush()
+        except Exception:
+            pass
+
+
+def truncate_utf8(text, max_bytes):
+    data = text.encode("utf-8")[:max_bytes]
+    while data:
+        try:
+            return data.decode("utf-8")
+        except UnicodeDecodeError:
+            data = data[:-1]
+    return ""
+
+
+def emit_error(message):
+    emit({"type": "error", "message": truncate_utf8(str(message), MAX_DIAGNOSTIC_MESSAGE_BYTES)})
+
+
+def emit_diagnostic(message):
+    emit({
+        "type": "diagnostic",
+        "level": "warn",
+        "message": truncate_utf8(str(message), MAX_DIAGNOSTIC_MESSAGE_BYTES),
+    })
+
+
+def log_stderr(message):
+    """Worker forwards helper stderr as rate-limited diagnostics."""
+    try:
+        sys.stderr.write("helper: %s\n" % message)
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Device identity: deterministic, reversible UUID <-> Bluetooth MAC mapping.
+# Both UUID and MAC are normalized to UPPERCASE so lookups across the Worker,
+# UI, BlueZ D-Bus paths, and internal caches always match.
+# ---------------------------------------------------------------------------
+
+def mac_to_uuid(mac):
+    if not isinstance(mac, str):
+        return None
+    hexdigits = mac.replace(":", "").replace("-", "").lower()
+    if len(hexdigits) != 12 or any(c not in "0123456789abcdef" for c in hexdigits):
+        return None
+    # 8-4-4-4-12 with the 12 MAC hex digits embedded across the groups.
+    return ("%s-%s-4%s-8%s-%s000000" % (
+        hexdigits[0:8],
+        hexdigits[8:12],
+        hexdigits[0:3],
+        hexdigits[3:6],
+        hexdigits[6:12],
+    )).upper()
+
+
+def uuid_to_mac(value):
+    if not isinstance(value, str):
+        return None
+    hexdigits = value.strip().lower().replace("-", "")
+    if len(hexdigits) != 32 or any(c not in "0123456789abcdef" for c in hexdigits):
+        return None
+    mac_hex = hexdigits[0:12]
+    # Verify the filler groups match our derivation scheme.
+    if hexdigits[12] != "4" or hexdigits[16] != "8":
+        return None
+    if hexdigits[13:16] != mac_hex[0:3] or hexdigits[17:20] != mac_hex[3:6]:
+        return None
+    if hexdigits[20:26] != mac_hex[6:12] or hexdigits[26:32] != "000000":
+        return None
+    return ":".join(mac_hex[i:i + 2] for i in range(0, 12, 2)).upper()
+
+
+# ---------------------------------------------------------------------------
+# USB serial reset helper.
+# The AI Passport firmware stops BLE advertising after every disconnect or
+# idle timeout. When the board is plugged in via USB (/dev/ttyACM*), pulsing
+# RTS reboots the ESP32 so it starts advertising again without entering the
+# ROM bootloader.
+# ---------------------------------------------------------------------------
+
+def find_serial_port():
+    if DISABLE_USB_RESET:
+        return None
+    override = os.environ.get("VOKIE_PASSPORT_SERIAL_PORT", "").strip()
+    if override and os.path.exists(override):
+        return override
+    if os.path.exists("/dev/ttyACM0"):
+        return "/dev/ttyACM0"
+    try:
+        for name in sorted(os.listdir("/dev")):
+            if name.startswith("ttyACM") or name.startswith("ttyUSB"):
+                return "/dev/" + name
+    except Exception:
+        pass
+    return None
+
+
+def usb_reset_pulse(port=None):
+    target_port = port or find_serial_port()
+    if not target_port:
+        return False
+    try:
+        fd = os.open(target_port, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+    except OSError as exc:
+        dbg("usb_reset_pulse open %s failed: %s" % (target_port, exc))
+        return False
+    try:
+        idle = struct.unpack("i", fcntl.ioctl(fd, TIOCMGET, b"\x00\x00\x00\x00"))[0]
+        fcntl.ioctl(fd, TIOCMSET, struct.pack("i", TIOCM_RTS))
+        time.sleep(0.15)
+        fcntl.ioctl(fd, TIOCMSET, struct.pack("i", 0))
+        time.sleep(0.1)
+        fcntl.ioctl(fd, TIOCMSET, struct.pack("i", idle))
+        log_stderr("sent USB reset pulse on %s to resume BLE advertising" % target_port)
+        return True
+    except OSError as exc:
+        dbg("usb_reset_pulse ioctl on %s failed: %s" % (target_port, exc))
+        return False
+    finally:
+        try:
+            os.close(fd)
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Audio frame reassembly (mirrors AudioFrameAssembler in protocol.mjs).
+# ---------------------------------------------------------------------------
+
+class AudioAssembler:
+    def __init__(self):
+        self.frames = OrderedDict()      # key -> {count, parts, total}
+        self.completed = OrderedDict()   # key -> True (FIFO cache)
+
+    def reset(self):
+        self.frames.clear()
+        self.completed.clear()
+
+    def push(self, data):
+        """Returns (session_id, sequence, 166-byte ADPCM payload) or None."""
+        if len(data) < AUDIO_HEADER_BYTES:
+            emit_diagnostic("audio fragment too short")
+            return None
+        magic = struct.unpack_from("<H", data, 0)[0]
+        if magic != AUDIO_MAGIC:
+            emit_diagnostic("Invalid audio magic")
+            return None
+        if data[2] != 1:
+            emit_diagnostic("Unsupported audio version")
+            return None
+        if data[3] != 0:
+            emit_diagnostic("Invalid audio reserved byte")
+            return None
+        session_id = struct.unpack_from("<I", data, 4)[0]
+        sequence = struct.unpack_from("<I", data, 8)[0]
+        index = data[12]
+        count = data[13]
+        payload_len = struct.unpack_from("<H", data, 14)[0]
+        if count == 0 or count > MAX_AUDIO_FRAGMENTS or index >= count:
+            emit_diagnostic("Invalid audio fragment index")
+            return None
+        if sequence >= MAX_AUDIO_SEQUENCE:
+            emit_diagnostic("Invalid audio sequence")
+            return None
+        if payload_len == 0 or payload_len > ADPCM_FRAME_BYTES:
+            emit_diagnostic("Invalid audio fragment payload length")
+            return None
+        if len(data) != AUDIO_HEADER_BYTES + payload_len:
+            emit_diagnostic("Audio fragment length mismatch")
+            return None
+
+        key = "%d:%d" % (session_id, sequence)
+        if key in self.completed:
+            return None
+        frame = self.frames.get(key)
+        if frame is None:
+            if len(self.frames) >= MAX_PENDING_AUDIO_FRAMES:
+                oldest = next(iter(self.frames))
+                del self.frames[oldest]
+                emit_diagnostic("audio frame evicted before completion: %s" % oldest)
+            frame = {"count": count, "parts": {}, "total": 0}
+            self.frames[key] = frame
+        if frame["count"] != count:
+            emit_diagnostic("Audio fragment count changed: %s" % key)
+            return None
+        payload = bytes(data[AUDIO_HEADER_BYTES:])
+        if index not in frame["parts"]:
+            if frame["total"] + payload_len > ADPCM_FRAME_BYTES:
+                del self.frames[key]
+                emit_diagnostic("audio frame exceeds ADPCM payload limit: %s" % key)
+                return None
+            frame["parts"][index] = payload
+            frame["total"] += payload_len
+        if len(frame["parts"]) != frame["count"]:
+            return None
+        del self.frames[key]
+        if frame["total"] != ADPCM_FRAME_BYTES:
+            emit_diagnostic("incomplete ADPCM frame payload: %s" % key)
+            return None
+        frame_bytes = b"".join(frame["parts"][i] for i in range(frame["count"]))
+        self.completed[key] = True
+        while len(self.completed) > COMPLETED_FRAME_CACHE:
+            self.completed.popitem(last=False)
+        return session_id, sequence, frame_bytes
+
+
+# ---------------------------------------------------------------------------
+# Helper state machine.
+# ---------------------------------------------------------------------------
+
+class Helper:
+    def __init__(self):
+        self.loop = None
+        self.stopping = False
+        self.stop_event = asyncio.Event()
+        self.wake_event = asyncio.Event()
+        self.preferred_generation = 0
+        self.preferred_uuid = None      # normalized UPPERCASE UUID
+        self.preferred_mac = None       # derived UPPERCASE Bluetooth address
+        self.preferred_opaque = False   # UUID we cannot map back to a MAC
+        self.discovered = {}            # UPPERCASE uuid -> (UPPERCASE mac, name)
+        self.ble_devices = {}           # UPPERCASE mac -> bleak BLEDevice
+        self.scan_emitted = {}          # UPPERCASE uuid -> emitted deviceName
+        self.assembler = AudioAssembler()
+        self.client = None
+        self.client_mac = None
+        self.control_char = None
+        self.connected = False
+        self.setting_up = False
+        self.setup_control_buffer = []
+        self.hello_emitted = False
+        self.subscribed_control = False
+        self.subscribed_audio = False
+        self.write_queue = []
+        self.write_inflight = False
+        self.host_ready_queued = False
+        self.host_ready_inflight = False
+        self.disconnected_event = None
+        self.reconnect_attempt = 0
+        self.bt_off_reported = False
+        self.rediscovery_needed = False
+        self.last_usb_reset_at = 0.0
+        self.needs_usb_reset = False
+
+    # -- lifecycle -----------------------------------------------------------
+
+    def _wake(self):
+        if self.loop is not None:
+            try:
+                self.loop.call_soon_threadsafe(self.wake_event.set)
+            except RuntimeError:
+                pass
+
+    def request_stop(self):
+        self.stopping = True
+        if self.loop is not None:
+            try:
+                self.loop.call_soon_threadsafe(self.stop_event.set)
+                self.loop.call_soon_threadsafe(self.wake_event.set)
+            except RuntimeError:
+                pass
+
+    async def _sleep_interruptible(self, duration, generation=None):
+        deadline = time.monotonic() + duration
+        while not self.stopping:
+            if generation is not None and self.preferred_generation != generation:
+                return False
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return True
+            self.wake_event.clear()
+            if generation is not None and self.preferred_generation != generation:
+                return False
+            if self.stopping:
+                return False
+            try:
+                await asyncio.wait_for(
+                    self.wake_event.wait(), timeout=min(remaining, 0.25)
+                )
+            except asyncio.TimeoutError:
+                pass
+        return False
+
+    async def maybe_usb_reset(self, generation=None, force=False):
+        if DISABLE_USB_RESET or self.stopping:
+            return False
+        now = time.monotonic()
+        if not force and (now - self.last_usb_reset_at) < USB_RESET_COOLDOWN:
+            return False
+        port = find_serial_port()
+        if not port:
+            return False
+        self.last_usb_reset_at = now
+        self.needs_usb_reset = False
+        ok = await asyncio.get_running_loop().run_in_executor(
+            None, usb_reset_pulse, port
+        )
+        if ok:
+            await self._sleep_interruptible(USB_BOOT_WAIT, generation=generation)
+            # Discard any BLEDevice cached while boot_sound (1.1s..3.3s) was
+            # playing so we only connect on a post-boot advertisement.
+            self.ble_devices.clear()
+        return ok
+
+    # -- stdout event emitters ------------------------------------------------
+
+    def emit_discovered(self, mac, name, ble_device=None):
+        norm_mac = mac.strip().upper()
+        if ble_device is not None:
+            self.ble_devices[norm_mac] = ble_device
+        device_uuid = mac_to_uuid(norm_mac)
+        if device_uuid is None:
+            return
+        prev_entry = self.discovered.get(device_uuid)
+        resolved_name = (
+            name.strip()
+            if isinstance(name, str) and name.strip()
+            else (prev_entry[1] if prev_entry and prev_entry[1] else "Vokie Passport")
+        )
+        self.discovered[device_uuid] = (norm_mac, resolved_name)
+        prev_emitted_name = self.scan_emitted.get(device_uuid)
+        if prev_emitted_name == resolved_name:
+            return
+        # Emit on first sighting, or re-emit if we previously only had a fallback
+        # name and just learned the real peripheral name from a scan response.
+        if prev_emitted_name is not None and prev_emitted_name != "Vokie Passport":
+            return
+        self.scan_emitted[device_uuid] = resolved_name
+        emit({
+            "type": "discovered",
+            "deviceId": device_uuid,
+            "deviceName": truncate_utf8(resolved_name, MAX_DEVICE_FIELD_BYTES),
+        })
+
+    # -- control writes -------------------------------------------------------
+
+    def queue_control_write(self, payload):
+        if self.stopping:
+            return
+        if payload == HOST_READY_BYTES:
+            if self.host_ready_queued or self.host_ready_inflight:
+                return
+            self.host_ready_queued = True
+        if len(self.write_queue) >= CONTROL_WRITE_QUEUE_LIMIT:
+            emit_error("BLE control write queue overflow")
+            return
+        self.write_queue.append(payload)
+        self._schedule_flush()
+
+    def _schedule_flush(self):
+        if self.loop is None:
+            return
+        try:
+            self.loop.call_soon_threadsafe(
+                lambda: asyncio.ensure_future(self._flush_writes()))
+        except RuntimeError:
+            pass
+
+    async def _flush_writes(self):
+        if not self.connected or self.client is None or self.write_inflight:
+            return
+        while self.write_queue and self.connected and not self.stopping:
+            payload = self.write_queue[0]
+            if payload == HOST_READY_BYTES:
+                self.host_ready_queued = False
+                self.host_ready_inflight = True
+            ok = await self._write_with_retry(payload)
+            self.write_inflight = False
+            if payload == HOST_READY_BYTES:
+                self.host_ready_inflight = False
+            if ok:
+                self.write_queue.pop(0)
+            else:
+                emit_error("BLE control write failed")
+                return
+
+    async def _write_with_retry(self, payload):
+        self.write_inflight = True
+        target_char = self.control_char if self.control_char is not None else CONTROL_UUID
+        for attempt in range(CONTROL_WRITE_RETRIES + 1):
+            if not self.connected or self.client is None:
+                self.write_inflight = False
+                return False
+            try:
+                await self.client.write_gatt_char(target_char, payload, response=True)
+                return True
+            except Exception as exc:
+                emit_diagnostic("Control write failed; retrying: %s" % exc)
+                if attempt < CONTROL_WRITE_RETRIES:
+                    await asyncio.sleep(CONTROL_WRITE_RETRY_INTERVAL)
+        return False
+
+    # -- BLE callbacks ---------------------------------------------------------
+
+    def _is_passport_advertisement(self, device, adv_data):
+        addr = (getattr(device, "address", "") or "").strip().upper()
+        name = ""
+        try:
+            name = (
+                (adv_data.local_name if adv_data and adv_data.local_name else None)
+                or device.name
+                or ""
+            )
+        except Exception:
+            name = ""
+        service_uuids = []
+        try:
+            service_uuids = [u.lower() for u in (adv_data.service_uuids or [])]
+        except Exception:
+            pass
+        lower_name = name.lower()
+        is_match = (
+            SERVICE_UUID.lower() in service_uuids
+            or "vokie" in lower_name
+            or "passport" in lower_name
+            or (DEFAULT_TARGET_MAC and addr == DEFAULT_TARGET_MAC)
+            or (self.preferred_mac and addr == self.preferred_mac.upper())
+        )
+        return is_match, addr, name
+
+    def _on_scan_detected(self, device, adv_data):
+        if self.stopping:
+            return
+        is_match, addr, name = self._is_passport_advertisement(device, adv_data)
+        if not is_match or not addr:
+            return
+        self.emit_discovered(addr, name, ble_device=device)
+        if self.preferred_uuid is not None and self.preferred_mac is None:
+            try:
+                if mac_to_uuid(addr) == self.preferred_uuid:
+                    self.preferred_mac = addr
+                    self._wake()
+            except Exception:
+                pass
+        elif self.preferred_mac and addr == self.preferred_mac:
+            self._wake()
+
+    def _emit_or_buffer_control_payload(self, payload):
+        if len(payload) > MAX_CONTROL_PAYLOAD_BYTES:
+            emit_diagnostic("Control notification too large")
+            return
+        try:
+            parsed = json.loads(payload.decode("utf-8"))
+            if isinstance(parsed, dict) and parsed.get("type") == "hello":
+                if self.hello_emitted:
+                    return
+                self.hello_emitted = True
+        except Exception:
+            pass
+        emit({
+            "type": "control",
+            "payloadBase64": base64.b64encode(payload).decode("ascii"),
+        })
+
+    def _on_control_notify(self, sender, data):
+        try:
+            payload = bytes(data)
+        except Exception:
+            return
+        if len(payload) > MAX_CONTROL_PAYLOAD_BYTES:
+            emit_diagnostic("Control notification too large")
+            return
+        if self.setting_up and not self.connected:
+            self.setup_control_buffer.append(payload)
+            return
+        self._emit_or_buffer_control_payload(payload)
+
+    def _on_audio_notify(self, sender, data):
+        try:
+            result = self.assembler.push(bytes(data))
+        except Exception as exc:
+            emit_diagnostic("audio ingest failed: %s" % exc)
+            return
+        if result is None:
+            return
+        session_id, sequence, frame = result
+        emit({
+            "type": "audio",
+            "sessionId": session_id,
+            "sequence": sequence,
+            "payloadBase64": base64.b64encode(frame).decode("ascii"),
+        })
+
+    def _on_disconnect(self, client):
+        dbg("bleak disconnected_callback fired")
+        if self.loop is None:
+            return
+        try:
+            self.loop.call_soon_threadsafe(self._handle_disconnect, client)
+        except RuntimeError:
+            pass
+
+    def _handle_disconnect(self, client=None):
+        if client is not None and self.client is not None and client is not self.client:
+            return
+        dbg("_handle_disconnect (was_connected=%s)" % self.connected)
+        was_connected = self.connected
+        self.connected = False
+        self.setting_up = False
+        self.setup_control_buffer = []
+        self.hello_emitted = False
+        self.control_char = None
+        self.subscribed_control = False
+        self.subscribed_audio = False
+        self.write_queue = []
+        self.host_ready_queued = False
+        self.host_ready_inflight = False
+        self.write_inflight = False
+        self.assembler.reset()
+        # Firmware stops advertising after every BLE disconnect; mark for
+        # rediscovery and USB reset pulse before the next connection attempt.
+        self.rediscovery_needed = True
+        self.needs_usb_reset = True
+        if self.client_mac:
+            self.ble_devices.pop(self.client_mac.upper(), None)
+        if self.disconnected_event is not None:
+            self.disconnected_event.set()
+        if was_connected:
+            device_uuid = mac_to_uuid(self.client_mac) if self.client_mac else None
+            if device_uuid:
+                emit({"type": "disconnected", "deviceId": device_uuid})
+            else:
+                emit({"type": "disconnected"})
+            log_stderr("disconnected from %s" % self.client_mac)
+
+    # -- hello validation -------------------------------------------------------
+
+    def build_validated_info_hello(self, data):
+        """Validate the Device-info hello and return a rebuilt JSON payload."""
+        try:
+            value = json.loads(bytes(data).decode("utf-8"))
+        except Exception:
+            emit_diagnostic("Invalid AI Passport info value")
+            return None
+        if not isinstance(value, dict):
+            emit_diagnostic("Invalid AI Passport info value")
+            return None
+        version = value.get("v")
+        if isinstance(version, bool) or version != 1:
+            emit_diagnostic("Invalid AI Passport info value")
+            return None
+        if value.get("device") != "ai-passport":
+            emit_diagnostic("Invalid AI Passport info value")
+            return None
+        fw = value.get("fw")
+        if (not isinstance(fw, str) or not fw.strip()
+                or len(fw.encode("utf-8")) > MAX_DEVICE_FIELD_BYTES):
+            emit_diagnostic("Invalid AI Passport info value")
+            return None
+        if value.get("codec") != "ima-adpcm":
+            emit_diagnostic("Invalid AI Passport info value")
+            return None
+        if (value.get("sampleRate") != 16000 or value.get("channels") != 1
+                or value.get("frameMs") != 20):
+            emit_diagnostic("Invalid AI Passport info value")
+            return None
+        hello = {
+            "v": 1,
+            "type": "hello",
+            "device": "ai-passport",
+            "fw": fw,
+            "codec": "ima-adpcm",
+            "sampleRate": 16000,
+            "channels": 1,
+            "frameMs": 20,
+        }
+        return json.dumps(hello, separators=(",", ":")).encode("utf-8")
+
+    # -- scanning -----------------------------------------------------------------
+
+    async def _start_scanner(self):
+        last_exc = None
+        for attempt in range(3):
+            scanner = BleakScanner(detection_callback=self._on_scan_detected)
+            try:
+                await scanner.start()
+                return scanner
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                try:
+                    await scanner.stop()
+                except Exception:
+                    pass
+                dbg("scanner.start attempt %d failed: %s" % (attempt + 1, exc))
+                await asyncio.sleep(0.5)
+        raise last_exc if last_exc is not None else RuntimeError(
+            "failed to start BLE scanner")
+
+    async def _stop_scanner_safely(self, scanner):
+        if scanner is None:
+            return
+        try:
+            await scanner.stop()
+        except Exception:
+            pass
+        # Give BlueZ HCI controller a brief moment to settle out of LE Scan
+        # before starting another scan or initiating an LE Create Connection.
+        await asyncio.sleep(0.25)
+
+    async def discover_loop(self):
+        """No preferred device: scan and report discoveries, never connect."""
+        generation = self.preferred_generation
+        try:
+            scanner = await self._start_scanner()
+        except Exception as exc:
+            self._report_adapter_failure(exc)
+            return
+        self.bt_off_reported = False
+        log_stderr("scanning for Vokie Passport devices")
+        scan_started = time.monotonic()
+        reset_attempted_in_scan = False
+        try:
+            while not self.stopping and self.preferred_generation == generation:
+                if (not self.scan_emitted
+                        and not reset_attempted_in_scan
+                        and (time.monotonic() - scan_started) >= SCAN_RESET_TRIGGER_DELAY):
+                    reset_attempted_in_scan = True
+                    await self.maybe_usb_reset(generation=generation)
+                await self._sleep_interruptible(0.25, generation=generation)
+        finally:
+            await self._stop_scanner_safely(scanner)
+
+    async def scan_for_preferred(self, generation):
+        """Scan until the preferred device advertises and we cache its BLEDevice."""
+        # Always clear any cached BLEDevice before scanning so we wait for a
+        # fresh over-the-air advertisement rather than a stale BlueZ cache hit.
+        if self.preferred_mac:
+            self.ble_devices.pop(self.preferred_mac.upper(), None)
+        try:
+            scanner = await self._start_scanner()
+        except Exception as exc:
+            self._report_adapter_failure(exc)
+            return
+        self.bt_off_reported = False
+        scan_started = time.monotonic()
+        reset_attempted = False
+        try:
+            deadline = scan_started + SCAN_FOR_PREFERRED_WINDOW
+            while (not self.stopping
+                   and self.preferred_generation == generation
+                   and time.monotonic() < deadline):
+                self._try_resolve_preferred_from_cache()
+                if (self.preferred_mac is not None
+                        and self.preferred_mac in self.ble_devices):
+                    # Let BlueZ finish processing the scan response before
+                    # stopping discovery and initiating LE Create Connection.
+                    await asyncio.sleep(0.35)
+                    return
+                if (not reset_attempted
+                        and (time.monotonic() - scan_started) >= SCAN_RESET_TRIGGER_DELAY):
+                    reset_attempted = True
+                    if await self.maybe_usb_reset(generation=generation):
+                        deadline = max(
+                            deadline, time.monotonic() + SCAN_FOR_PREFERRED_WINDOW * 0.5
+                        )
+                await self._sleep_interruptible(0.2, generation=generation)
+        finally:
+            await self._stop_scanner_safely(scanner)
+
+    def _report_adapter_failure(self, exc):
+        message = str(exc).lower()
+        if "off" in message or "power" in message:
+            if not self.bt_off_reported:
+                self.bt_off_reported = True
+                emit_error("Bluetooth is powered off")
+            else:
+                emit_diagnostic("Bluetooth is powered off")
+        else:
+            emit_error("Bluetooth is unavailable: %s" % exc)
+
+    def _try_resolve_preferred_from_cache(self):
+        if self.preferred_uuid is None:
+            return
+        if self.preferred_mac is None:
+            if self.preferred_opaque:
+                cached = self.discovered.get(self.preferred_uuid)
+                if cached is not None:
+                    self.preferred_mac = cached[0]
+            else:
+                self.preferred_mac = uuid_to_mac(self.preferred_uuid)
+
+    async def resolve_preferred_mac(self, generation):
+        """Turn the preferred UUID into a MAC + cached BLEDevice, scanning if needed."""
+        self._try_resolve_preferred_from_cache()
+        if self.preferred_uuid is None:
+            return
+        if (self.preferred_mac is None
+                or self.rediscovery_needed
+                or self.preferred_mac not in self.ble_devices):
+            self.rediscovery_needed = False
+            await self.scan_for_preferred(generation)
+            self._try_resolve_preferred_from_cache()
+
+    async def _clear_stale_bluez_device(self, norm_mac):
+        """Remove a stale BlueZ Paired/Bonded entry if GATT service discovery fails."""
+        try:
+            from dbus_fast.aio import MessageBus
+            from dbus_fast import BusType, Message
+        except Exception:
+            return False
+        dev_path = "/org/bluez/hci0/dev_" + norm_mac.replace(":", "_")
+        bus = None
+        try:
+            bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+            reply = await bus.call(Message(
+                destination="org.bluez",
+                path=dev_path,
+                interface="org.freedesktop.DBus.Properties",
+                member="GetAll",
+                signature="s",
+                body=["org.bluez.Device1"],
+            ))
+            props = reply.body[0] if reply and reply.body else {}
+            paired = bool(props.get("Paired").value) if "Paired" in props else False
+            bonded = bool(props.get("Bonded").value) if "Bonded" in props else False
+            if not paired and not bonded:
+                return False
+            await bus.call(Message(
+                destination="org.bluez",
+                path="/org/bluez/hci0",
+                interface="org.bluez.Adapter1",
+                member="RemoveDevice",
+                signature="o",
+                body=[dev_path],
+            ))
+            log_stderr("removed stale BlueZ bond for %s" % norm_mac)
+            return True
+        except Exception as exc:
+            dbg("_clear_stale_bluez_device failed: %s" % exc)
+            return False
+        finally:
+            if bus is not None:
+                try:
+                    bus.disconnect()
+                except Exception:
+                    pass
+
+    # -- connection ---------------------------------------------------------------
+
+    async def connect_and_serve(self, mac, generation):
+        norm_mac = mac.strip().upper()
+        self.disconnected_event = asyncio.Event()
+        self.assembler.reset()
+        self.setting_up = True
+        self.setup_control_buffer = []
+        self.hello_emitted = False
+        self.control_char = None
+
+        target = self.ble_devices.get(norm_mac) or norm_mac
+        client = None
+        last_exc = None
+        for connect_try in range(2):
+            if self.stopping or self.preferred_generation != generation:
+                self.setting_up = False
+                return True
+            if connect_try > 0:
+                await asyncio.sleep(0.8)
+                try:
+                    fresh = await BleakScanner.find_device_by_address(norm_mac, timeout=5.0)
+                    if fresh is not None:
+                        self.ble_devices[norm_mac] = fresh
+                        target = fresh
+                except Exception:
+                    pass
+            client = BleakClient(
+                target,
+                disconnected_callback=self._on_disconnect,
+                timeout=CONNECT_TIMEOUT,
+            )
+            self.client = client
+            self.client_mac = norm_mac
+            try:
+                await client.connect()
+                last_exc = None
+                break
+            except Exception as exc:
+                last_exc = exc
+                self.client = None
+                await self._safe_disconnect(client)
+                err_low = (str(exc) or "").lower()
+                if connect_try == 0 and ("discover services" in err_low or "disconnected" in err_low):
+                    if await self._clear_stale_bluez_device(norm_mac):
+                        self.ble_devices.pop(norm_mac, None)
+                        target = norm_mac
+
+        if last_exc is not None:
+            exc = last_exc
+            self.client = None
+            self.setting_up = False
+            self.setup_control_buffer = []
+            self.ble_devices.pop(norm_mac, None)
+            self.rediscovery_needed = True
+            self.needs_usb_reset = True
+            message = str(exc).strip() or exc.__class__.__name__
+            lower = message.lower()
+            if ("not found" in lower
+                    or "not available" in lower
+                    or "timed out" in lower
+                    or "timeout" in lower
+                    or "abort" in lower
+                    or "discover services" in lower
+                    or "disconnected" in lower):
+                emit_diagnostic("AI Passport connect retry (%s)" % message)
+                return False
+            emit_error("Failed to connect to AI Passport: %s" % message)
+            return False
+
+        if self.stopping or self.preferred_generation != generation:
+            await self._safe_disconnect(client)
+            self.client = None
+            self.setting_up = False
+            return True
+
+        # A disconnect requested before/during connect must not abandon a
+        # freshly established session for the current generation.
+        self.disconnected_event.clear()
+
+        try:
+            service = client.services.get_service(SERVICE_UUID)
+            if service is None:
+                emit_error("Voice service not found")
+                await self._safe_disconnect(client)
+                return False
+            control = service.get_characteristic(CONTROL_UUID)
+            audio = service.get_characteristic(AUDIO_UUID)
+            info = service.get_characteristic(INFO_UUID)
+            if control is None or audio is None:
+                emit_error("Control or Audio characteristic not found")
+                await self._safe_disconnect(client)
+                return False
+
+            self.control_char = control
+            await client.start_notify(control, self._on_control_notify)
+            self.subscribed_control = True
+            await client.start_notify(audio, self._on_audio_notify)
+            self.subscribed_audio = True
+
+            info_hello_payload = None
+            if info is not None:
+                try:
+                    data = await client.read_gatt_char(info)
+                    info_hello_payload = self.build_validated_info_hello(data)
+                except Exception as exc:
+                    emit_diagnostic("Info read failed: %s" % exc)
+
+            device_uuid = mac_to_uuid(norm_mac)
+            cached = self.discovered.get(device_uuid)
+            display_name = cached[1] if cached and cached[1] else "Vokie Passport"
+            self.emit_discovered(norm_mac, display_name)
+
+            self.connected = True
+            self.setting_up = False
+            self.reconnect_attempt = 0
+
+            # Emit connected and subscribed BEFORE hello/control events so the
+            # Worker records lastDevice before deviceHello transitions to true.
+            emit({
+                "type": "connected",
+                "deviceId": device_uuid,
+                "deviceName": truncate_utf8(display_name, MAX_DEVICE_FIELD_BYTES),
+                "preferredDeviceId": self.preferred_uuid or device_uuid,
+            })
+            emit({"type": "subscribed"})
+            log_stderr("connected to %s (%s)" % (display_name, norm_mac))
+
+            buffered = list(self.setup_control_buffer)
+            self.setup_control_buffer = []
+            for payload in buffered:
+                self._emit_or_buffer_control_payload(payload)
+            if info_hello_payload is not None and not self.hello_emitted:
+                self._emit_or_buffer_control_payload(info_hello_payload)
+
+            # Subscriptions are live: flush any queued control writes.
+            # host_ready only goes out after subscribe, per the wire contract.
+            await self._flush_writes()
+
+            try:
+                await self.disconnected_event.wait()
+            except Exception as exc:
+                dbg("disconnected_event.wait raised: %r" % exc)
+            return True
+        except Exception as exc:
+            emit_diagnostic("connection error: %s" % exc)
+            dbg("connect_and_serve exception: %r" % exc)
+            self.rediscovery_needed = True
+            self.needs_usb_reset = True
+            return False
+        finally:
+            self.connected = False
+            self.setting_up = False
+            self.setup_control_buffer = []
+            self.hello_emitted = False
+            self.control_char = None
+            self.subscribed_control = False
+            self.subscribed_audio = False
+            self.write_queue = []
+            self.host_ready_queued = False
+            self.host_ready_inflight = False
+            self.write_inflight = False
+            self.assembler.reset()
+            await self._safe_disconnect(client)
+            self.client = None
+
+    async def _safe_disconnect(self, client):
+        try:
+            if client and client.is_connected:
+                await client.disconnect()
+        except Exception:
+            pass
+
+    def _request_disconnect(self):
+        """Force the active connection to drop so supervision re-evaluates."""
+        dbg("_request_disconnect called")
+        if self.loop is None:
+            return
+
+        async def _do():
+            dbg("_request_disconnect executing")
+            client = self.client
+            if client is None:
+                return
+            try:
+                if client.is_connected:
+                    await client.disconnect()
+            except Exception:
+                pass
+            if self.disconnected_event is not None:
+                self.disconnected_event.set()
+
+        try:
+            self.loop.call_soon_threadsafe(lambda: asyncio.ensure_future(_do()))
+        except RuntimeError:
+            pass
+
+    # -- supervision -----------------------------------------------------------------
+
+    async def supervise(self):
+        while not self.stopping:
+            generation = self.preferred_generation
+            try:
+                if self.preferred_uuid is None:
+                    self.preferred_mac = None
+                    self.scan_emitted = {}
+                    await self.discover_loop()
+                    # If preferred_uuid was just set by stdin, jump straight to
+                    # connecting without a backoff delay!
+                    if self.preferred_generation != generation:
+                        continue
+                else:
+                    await self.resolve_preferred_mac(generation)
+                    if self.stopping or self.preferred_generation != generation:
+                        continue
+                    if (self.preferred_mac is None
+                            or self.preferred_mac not in self.ble_devices):
+                        emit_diagnostic("Preferred AI Passport device not found yet")
+                        self.rediscovery_needed = True
+                        self.needs_usb_reset = True
+                        await self._sleep_interruptible(RETRY_PAUSE, generation=generation)
+                        continue
+                    ok = await self.connect_and_serve(self.preferred_mac, generation)
+                    if self.stopping or self.preferred_generation != generation:
+                        continue
+                    if ok:
+                        # A previously healthy session disconnected; try quick
+                        # rediscovery (+ USB reset if attached) after a short pause.
+                        await self._sleep_interruptible(1.0, generation=generation)
+                        continue
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                emit_diagnostic("supervise error: %s" % exc)
+            if self.stopping:
+                break
+            if self.preferred_generation != generation:
+                continue
+            if self.preferred_uuid is not None:
+                self.reconnect_attempt += 1
+                backoff = min(2 ** self.reconnect_attempt, RECONNECT_MAX_BACKOFF)
+                log_stderr("reconnecting in %.0fs" % backoff)
+                await self._sleep_interruptible(backoff, generation=generation)
+            else:
+                await self._sleep_interruptible(RETRY_PAUSE, generation=generation)
+
+    # -- command handling (called from the stdin thread) ------------------------------
+
+    def handle_command_line(self, line):
+        if len(line) > MAX_COMMAND_LINE_BYTES:
+            emit_diagnostic("Helper command line too long")
+            return
+        try:
+            cmd = json.loads(line.decode("utf-8"))
+        except Exception:
+            emit_diagnostic("Invalid helper command")
+            return
+        if not isinstance(cmd, dict) or "type" not in cmd:
+            emit_diagnostic("Invalid helper command")
+            return
+        cmd_type = cmd.get("type")
+        if cmd_type == "shutdown":
+            self.request_stop()
+            return
+        if cmd_type == "host_ready":
+            self.queue_control_write(HOST_READY_BYTES)
+            return
+        if cmd_type == "host_state":
+            state = cmd.get("state")
+            if state not in VALID_HOST_STATES:
+                emit_diagnostic("Invalid host state")
+                return
+            obj = {"v": 1, "type": "host_state", "state": state}
+            message = cmd.get("message")
+            if (isinstance(message, str)
+                    and len(message.encode("utf-8")) <= MAX_DIAGNOSTIC_MESSAGE_BYTES):
+                obj["message"] = message
+            self.queue_control_write(json.dumps(obj, separators=(",", ":")).encode("utf-8"))
+            return
+        if cmd_type == "set-preferred-device":
+            device_id = cmd.get("deviceId")
+            if device_id is None:
+                self._set_preferred(None)
+                return
+            if isinstance(device_id, str):
+                self._set_preferred(device_id.strip())
+                return
+            emit_diagnostic("Invalid preferred device id")
+            return
+        emit_diagnostic("Unknown helper command")
+
+    def _set_preferred(self, device_id):
+        previous = self.preferred_uuid
+        if not device_id:
+            self.preferred_uuid = None
+            self.preferred_mac = None
+            self.preferred_opaque = False
+            self.reconnect_attempt = 0
+            self.rediscovery_needed = False
+            self.scan_emitted = {}
+            log_stderr("preferred device cleared")
+        else:
+            norm_uuid = device_id.strip().upper()
+            mac = uuid_to_mac(norm_uuid)
+            if mac is None:
+                cached = self.discovered.get(norm_uuid)
+                if cached is not None:
+                    mac = cached[0]
+            self.preferred_uuid = norm_uuid
+            self.preferred_mac = mac
+            self.preferred_opaque = mac is None
+            self.reconnect_attempt = 0
+            self.rediscovery_needed = True
+            if mac:
+                self.ble_devices.pop(mac.upper(), None)
+            log_stderr("preferred device set to %s (mac=%s)" % (self.preferred_uuid, self.preferred_mac))
+        if previous != self.preferred_uuid:
+            self.preferred_generation += 1
+            self._wake()
+            # Drop the active connection (if any) when switching/clearing target.
+            if self.client is not None and (
+                self.preferred_mac is None or self.client_mac != self.preferred_mac
+            ):
+                self._request_disconnect()
+
+
+# ---------------------------------------------------------------------------
+# stdin reader thread and process supervision.
+# ---------------------------------------------------------------------------
+
+def stdin_loop(helper):
+    buffer = b""
+    while True:
+        try:
+            chunk = os.read(0, 4096)
+        except Exception:
+            chunk = b""
+        if not chunk:
+            # EOF: the worker closed our stdin, so shut down.
+            helper.request_stop()
+            return
+        buffer += chunk
+        while b"\n" in buffer:
+            line, buffer = buffer.split(b"\n", 1)
+            helper.handle_command_line(line)
+        if len(buffer) > MAX_LINE_BYTES:
+            buffer = b""
+            emit_diagnostic("Helper command input exceeded line size limit")
+
+
+def watchdog():
+    while True:
+        if os.getppid() != LAUNCH_PARENT_PID:
+            os._exit(0)
+        time.sleep(WATCHDOG_INTERVAL)
+
+
+async def amain():
+    helper = Helper()
+    helper.loop = asyncio.get_running_loop()
+
+    def _signal_handler(signum, frame):
+        helper.request_stop()
+
+    signal.signal(signal.SIGTERM, _signal_handler)
+    signal.signal(signal.SIGINT, _signal_handler)
+
+    supervisor = asyncio.ensure_future(helper.supervise())
+
+    reader = threading.Thread(target=stdin_loop, args=(helper,), daemon=True)
+    reader.start()
+    threading.Thread(target=watchdog, daemon=True).start()
+
+    await helper.stop_event.wait()
+    helper.stopping = True
+    helper.wake_event.set()
+    supervisor.cancel()
+    try:
+        await supervisor
+    except (asyncio.CancelledError, Exception):
+        pass
+    if helper.client is not None:
+        await helper._safe_disconnect(helper.client)
+    log_stderr("shutting down")
+    # Match the Swift helper: brief delay, then exit successfully.
+    await asyncio.sleep(0.1)
+    return 0
+
+
+def main():
+    # Keep third-party logging quiet; the worker rate-limits forwarded
+    # diagnostics, so only our own stderr notes are emitted.
+    import logging
+    logging.disable(logging.CRITICAL)
+    try:
+        asyncio.run(amain())
+    except KeyboardInterrupt:
+        pass
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()

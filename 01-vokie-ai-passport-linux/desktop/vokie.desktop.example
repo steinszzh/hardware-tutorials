@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Vokie
+Exec=/path/to/hardware-tutorials/01-vokie-ai-passport-linux/scripts/start-vokie.sh %U
+Terminal=false
+Type=Application
+Icon=vokie
+StartupWMClass=Vokie
+Comment=Vokie (with Linux AI Passport Bridge)
+Categories=Utility;Audio;
