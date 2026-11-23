@@ -9,6 +9,9 @@ ORIG_ASAR="${VOKIE_ORIG_ASAR:-/opt/Vokie/resources/app.asar}"
 
 mkdir -p "$VOKIE_CFG"
 
+# Prevent Vokie's built-in autostart entry from launching unpatched /opt/Vokie/vokie first
+rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/autostart/com.vokie.desktop"
+
 if [[ ! -f "$SO_PATH" || "$SCRIPT_DIR/asar_override.c" -nt "$SO_PATH" ]]; then
     gcc -shared -fPIC -O2 "$SCRIPT_DIR/asar_override.c" -o "$SO_PATH" -ldl
 fi

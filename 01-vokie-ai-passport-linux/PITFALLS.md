@@ -1,6 +1,6 @@
 # 踩坑实录：Linux + Vokie + FoloToy AI Passport 蓝牙联调
 
-本文记录在 Ubuntu Linux 上从零打通 **Vokie 桌面端 ↔ FoloToy AI Passport (ESP32 NimBLE)** 过程中踩到的 7 个真实深坑。按排查难度与杀伤力排序，方便后续遇到类似 BLE / Electron / ESP32 问题时直接对照定位。
+本文记录在 Ubuntu Linux 上从零打通 **Vokie 桌面端 ↔ FoloToy AI Passport (ESP32 NimBLE)** 过程中踩到的 8 个真实深坑。按排查难度与杀伤力排序，方便后续遇到类似 BLE / Electron / ESP32 问题时直接对照定位。
 
 ---
 
@@ -133,23 +133,58 @@ Failed to connect to AI Passport:
 
 ---
 
+## 坑 8：系统重启后 `com.vokie.desktop` 抢占 Electron 单例锁导致补丁完全失效
+
+### 现象
+- 已经把 `~/.config/autostart/vokie.desktop` 改成了 `start-vokie.sh`，手动重启 Vokie 一切正常；
+- 但**一旦重启电脑**，Vokie 又变回原版：看不到外接设备，`ps aux` 里找不到 `ai-passport-helper`，`/proc/<pid>/environ` 里也没有 `LD_PRELOAD`。
+
+### 根因
+Vokie 内置的「开机自启」开关（`~/.config/vokie/app-settings.json` 中的 `"launchAtLogin": true`）每次启动时，会自动写入一个 **`~/.config/autostart/com.vokie.desktop`**，其 `Exec=` 指向未打补丁的原版 `"/opt/Vokie/vokie" --ozone-platform=x11`。
+
+GNOME/桌面环境按文件名字母顺序加载自启项：`com.vokie.desktop`（`c` 开头）排在 `vokie.desktop`（`v` 开头）之前，因此：
+1. `com.vokie.desktop` 抢先启动原版 `/opt/Vokie/vokie`，占住 Electron 单例锁（`SingletonLock`）；
+2. 紧接着 `vokie.desktop` 拉起带 `LD_PRELOAD` 的 `start-vokie.sh`，检测到单例锁已存在后直接退出；
+3. 最终存活的只有未打补丁的原版进程。
+
+### 诊断命令
+```bash
+ls -la ~/.config/autostart/ | grep -i vokie
+tr '\0' '\n' < /proc/$(pgrep -f '/opt/Vokie/vokie' | head -n 1)/environ | grep LD_PRELOAD
+```
+
+### 解决方案
+1. 关闭 Vokie 内置自启：先退出 Vokie，再将 `~/.config/vokie/app-settings.json` 中的 `"launchAtLogin": true` 改为 `false`（之后不要在 Vokie 设置界面里重新打开它）；
+2. 删除冲突项，只保留指向 `start-vokie.sh` 的 `~/.config/autostart/vokie.desktop`：
+   ```bash
+   rm -f ~/.config/autostart/com.vokie.desktop
+   ```
+3. 在 `scripts/start-vokie.sh` 启动前加入防呆清理 `rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/autostart/com.vokie.desktop"`。
+
+---
+
 ## 附：快速排错 Checklist
 
-遇到连接异常时，按顺序跑这 4 条命令，99% 的问题 30 秒内定位：
+遇到连接异常时，按顺序跑这 5 条命令，99% 的问题 30 秒内定位：
 
-1. **看 Vokie 是否加载了补丁版 ASAR**：
+1. **看是否被原生自启项抢占 & 是否加载了补丁版 ASAR**：
    ```bash
+   ls -la ~/.config/autostart/ | grep -i vokie
    ls -l /proc/$(pgrep -f '/opt/Vokie/vokie' | head -n 1)/fd | grep app.asar
    ```
 2. **看 BlueZ 是否有残留配对**：
    ```bash
    bluetoothctl info <MAC> | grep -E 'Paired|Bonded|Connected'
    ```
-3. **看 Vokie 实时插件日志**：
+3. **看插件进程是否存活**：
+   ```bash
+   ps aux | grep ai-passport-helper | grep -v grep
+   ```
+4. **看 Vokie 实时插件日志**：
    ```bash
    tail -n 50 ~/.config/vokie/logs/app.log | grep -E 'external-device|helper'
    ```
-4. **看 ESP32 串口底层事件**（插着 USB 时）：
+5. **看 ESP32 串口底层事件**（插着 USB 时）：
    ```bash
    python3 -c 'import serial; s=serial.Serial("/dev/ttyACM0",115200); [print(s.readline().decode(errors="replace"),end="") for _ in range(100)]'
    ```

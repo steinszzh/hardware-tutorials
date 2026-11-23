@@ -6,7 +6,7 @@ Vokie 官方外接设备插件（AI Passport / Mote）默认仅面向 macOS（�
 
 本教程通过**零 root 侵入**的方式，在不修改 `/opt/Vokie` 系统文件的前提下，在 Linux 上完整打通 **FoloToy AI Passport ↔ BlueZ BLE ↔ Vokie 插件 Worker ↔ Vokie 桌面端 UI** 全链路。
 
-> 💡 **强烈建议同步阅读 [PITFALLS.md](./PITFALLS.md)**，里面完整记录了我们在实机联调过程中踩到的 7 个隐蔽深坑（BlueZ 残留绑定导致服务发现秒断、ESP32 开机提示音时序冲突、Electron ASAR 完整性校验等）。
+> 💡 **强烈建议同步阅读 [PITFALLS.md](./PITFALLS.md)**，里面完整记录了我们在实机联调过程中踩到的 8 个隐蔽深坑（BlueZ 残留绑定导致服务发现秒断、ESP32 开机提示音时序冲突、Electron ASAR 完整性校验、`com.vokie.desktop` 自启抢占单例锁等）。
 
 ---
 
@@ -130,6 +130,8 @@ chmod +x scripts/start-vokie.sh scripts/patch-vokie-asar.py
 - `~/.local/share/applications/vokie.desktop`（应用菜单启动）
 - `~/.config/autostart/vokie.desktop`（开机自启）
 
+> ⚠️ **重要**：请务必关闭 Vokie 设置里的内置「开机自启」（或退出 Vokie 后将 `~/.config/vokie/app-settings.json` 中的 `"launchAtLogin"` 设为 `false`），并删除 `~/.config/autostart/com.vokie.desktop`。否则系统重启时 `com.vokie.desktop` 会按字母顺序抢先启动未打补丁的原版进程并占住单例锁（详见 [PITFALLS.md #8](./PITFALLS.md#坑-8系统重启后-comvokiedesktop-抢占-electron-单例锁导致补丁完全失效)）。
+
 ---
 
 ## 4. 验证与排查命令
@@ -171,7 +173,7 @@ tail -f ~/.config/vokie/logs/app.log | grep -E 'external-device|ai-passport|help
 
 ## 5. 目录清单
 
-- [PITFALLS.md](./PITFALLS.md) — 7 大核心踩坑点与排查实录
+- [PITFALLS.md](./PITFALLS.md) — 8 大核心踩坑点与排查实录
 - [scripts/asar_override.c](./scripts/asar_override.c) — 无 root `LD_PRELOAD` 文件路径拦截库
 - [scripts/patch-vokie-asar.py](./scripts/patch-vokie-asar.py) — Electron ASAR 原位修补 + SHA256 哈希更新工具
 - [scripts/start-vokie.sh](./scripts/start-vokie.sh) — 一键编译、打补丁与启动脚本
