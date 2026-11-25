@@ -6,7 +6,7 @@ Vokie 官方外接设备插件（AI Passport / Mote）默认仅面向 macOS（�
 
 本教程通过**零 root 侵入**的方式，在不修改 `/opt/Vokie` 系统文件的前提下，在 Linux 上完整打通 **FoloToy AI Passport ↔ BlueZ BLE ↔ Vokie 插件 Worker ↔ Vokie 桌面端 UI** 全链路。
 
-> 💡 **强烈建议同步阅读 [PITFALLS.md](./PITFALLS.md)**，里面完整记录了我们在实机联调过程中踩到的 8 个隐蔽深坑（BlueZ 残留绑定导致服务发现秒断、ESP32 开机提示音时序冲突、Electron ASAR 完整性校验、`com.vokie.desktop` 自启抢占单例锁等）。
+> 💡 **强烈建议同步阅读 [PITFALLS.md](./PITFALLS.md)**，里面完整记录了我们在实机联调过程中踩到的 9 个隐蔽深坑（BlueZ 残留绑定导致服务发现秒断、ESP32 开机提示音时序冲突、Electron ASAR 完整性校验、`com.vokie.desktop` 自启抢占单例锁、GNOME 快捷方式找不到 `nvm` Node 等）。
 
 ---
 
@@ -173,7 +173,7 @@ tail -f ~/.config/vokie/logs/app.log | grep -E 'external-device|ai-passport|help
 
 ## 5. 目录清单
 
-- [PITFALLS.md](./PITFALLS.md) — 8 大核心踩坑点与排查实录
+- [PITFALLS.md](./PITFALLS.md) — 9 大核心踩坑点与排查实录
 - [scripts/asar_override.c](./scripts/asar_override.c) — 无 root `LD_PRELOAD` 文件路径拦截库
 - [scripts/patch-vokie-asar.py](./scripts/patch-vokie-asar.py) — Electron ASAR 原位修补 + SHA256 哈希更新工具
 - [scripts/start-vokie.sh](./scripts/start-vokie.sh) — 一键编译、打补丁与启动脚本

@@ -1,6 +1,6 @@
 # 踩坑实录：Linux + Vokie + FoloToy AI Passport 蓝牙联调
 
-本文记录在 Ubuntu Linux 上从零打通 **Vokie 桌面端 ↔ FoloToy AI Passport (ESP32 NimBLE)** 过程中踩到的 8 个真实深坑。按排查难度与杀伤力排序，方便后续遇到类似 BLE / Electron / ESP32 问题时直接对照定位。
+本文记录在 Ubuntu Linux 上从零打通 **Vokie 桌面端 ↔ FoloToy AI Passport (ESP32 NimBLE)** 过程中踩到的 9 个真实深坑。按排查难度与杀伤力排序，方便后续遇到类似 BLE / Electron / ESP32 问题时直接对照定位。
 
 ---
 
@@ -163,28 +163,59 @@ tr '\0' '\n' < /proc/$(pgrep -f '/opt/Vokie/vokie' | head -n 1)/environ | grep L
 
 ---
 
+## 坑 9：从 GNOME 快捷方式或开机自启启动时找不到 `nvm` 的 `node`，插件静默不启动
+
+### 现象
+- 从**终端**运行 `start-vokie.sh` 一切正常；
+- 但点 **GNOME 应用菜单快捷方式**或**开机自启**打开 Vokie 时，明明已经加载了补丁版 `app.asar`（`LD_PRELOAD` 生效，且 `PluginWebSocketServer` 已在 `127.0.0.1` 监听），却完全没有 `worker/index.mjs` 和 `ai-passport-helper` 进程，日志里也看不到任何插件输出，设备永远连不上。
+
+### 根因
+插件配置 `vokie.plugin.json` 中声明 `"runtime": "node"`，Vokie 会直接从 `PATH` 查找并启动 `node`。
+如果系统的 Node.js 是通过 `nvm` / `fnm` / `volta` 安装在用户目录（例如 `~/.nvm/versions/node/v22.x.x/bin/node`），而 `/usr/bin/node` 不存在：
+- 终端属于交互式 Shell，会加载 `~/.bashrc` 把 `nvm` 目录加入 `PATH`；
+- GNOME 桌面快捷方式（`.desktop`）和开机自启属于**非交互环境**，不加载 `~/.bashrc`，`PATH` 里只有 `/usr/local/bin:/usr/bin:/bin`，导致 Vokie 拉起 `node` 直接 `ENOENT` 失败。
+
+### 诊断命令
+```bash
+which node
+ls -la /usr/bin/node /usr/local/bin/node
+tr '\0' '\n' < /proc/$(pgrep -f '/opt/Vokie/vokie' | head -n 1)/environ | grep '^PATH='
+```
+
+### 解决方案
+1. 在 `scripts/start-vokie.sh` 启动 `/opt/Vokie/vokie` 前，检测 `command -v node`；若不存在则自动扫描 `~/.nvm`、`~/.fnm`、`~/.volta`、`~/.asdf`、`~/.local/bin` 并将其前置到 `PATH`（最新版 [scripts/start-vokie.sh](./scripts/start-vokie.sh) 已内置）；
+2. 同时建议在 `~/.local/share/applications/vokie.desktop` 的 `Exec=` 中显式加上 `--ozone-platform=x11 %U`，避免 Wayland 下二次重启；
+3. 如果之前排查时在 UI 里误关了插件开关，确认 `~/.config/vokie/plugins/registry.json` 中 `"enabled"` 为 `true`。
+
+---
+
 ## 附：快速排错 Checklist
 
-遇到连接异常时，按顺序跑这 5 条命令，99% 的问题 30 秒内定位：
+遇到连接异常时，按顺序跑这 6 条命令，99% 的问题 30 秒内定位：
 
 1. **看是否被原生自启项抢占 & 是否加载了补丁版 ASAR**：
    ```bash
    ls -la ~/.config/autostart/ | grep -i vokie
    ls -l /proc/$(pgrep -f '/opt/Vokie/vokie' | head -n 1)/fd | grep app.asar
    ```
-2. **看 BlueZ 是否有残留配对**：
+2. **看 Vokie 进程的 `PATH` 里有没有 `node`（以及插件是否处于 `enabled: true`）**：
+   ```bash
+   tr '\0' '\n' < /proc/$(pgrep -f '/opt/Vokie/vokie' | head -n 1)/environ | grep '^PATH='
+   grep '"enabled"' ~/.config/vokie/plugins/registry.json
+   ```
+3. **看 BlueZ 是否有残留配对**：
    ```bash
    bluetoothctl info <MAC> | grep -E 'Paired|Bonded|Connected'
    ```
-3. **看插件进程是否存活**：
+4. **看插件进程是否存活**：
    ```bash
    ps aux | grep ai-passport-helper | grep -v grep
    ```
-4. **看 Vokie 实时插件日志**：
+5. **看 Vokie 实时插件日志**：
    ```bash
    tail -n 50 ~/.config/vokie/logs/app.log | grep -E 'external-device|helper'
    ```
-5. **看 ESP32 串口底层事件**（插着 USB 时）：
+6. **看 ESP32 串口底层事件**（插着 USB 时）：
    ```bash
    python3 -c 'import serial; s=serial.Serial("/dev/ttyACM0",115200); [print(s.readline().decode(errors="replace"),end="") for _ in range(100)]'
    ```
